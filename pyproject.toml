@@ -1,0 +1,31 @@
+[project]
+name = "polymarket-mcp"
+version = "0.1.0"
+description = "Polymarket Quant MCP server: macro, markets, crypto pricing, politics/legal intel, cross-venue odds."
+requires-python = ">=3.11"
+# Pinned to the versions verified in .venv on 2026-11-05.
+dependencies = [
+    "fastmcp==4.1.6",
+    "httpx2==2.16.0",
+    "polymarket-client==0.16.0",
+    "python-dotenv==1.2.4",
+]
+
+[dependency-groups]
+dev = [
+    "mypy==2.4.1",
+    "pytest==9.2.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "live: real mcp_server.py subprocess over stdio calling real APIs (network; key-gated tests skip when their key is missing from .env)",
+]
+# Offline by default; run live tests with `pytest -m live`.
+addopts = "-m 'not live'"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
