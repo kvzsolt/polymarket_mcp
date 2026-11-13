@@ -14,6 +14,7 @@ import math
 import statistics
 from collections.abc import Callable
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import httpx2 as httpx
@@ -25,16 +26,19 @@ from fastmcp.exceptions import ToolError
 from crypto_client import CryptoSettings, ExpiryPricer
 from fred_client import FredError, FredSettings
 from gov_client import GovSettings
+from ledger_client import CalibrationMath, ForecastRecord, LedgerSettings
 from mcp_server import create_server
 from politics_intel_client import PoliticsIntelError, PoliticsIntelSettings, Poll, PollDropoutCalculator
-from poly_client import Level, OrderBookMath, OrderResult, PolySettings
+from poly_client import CancelResult, Level, OrderBookMath, OrderResult, PolyError, PolySettings, RestingOrder
 from polynode_client import PolynodeSettings
+from sec_client import SecSettings
 
 FRED = FredSettings(api_key="k" * 32)
 POLY = PolySettings(max_order_usd=100.0)
 POLYNODE = PolynodeSettings(api_key="pn_live_test")
 GOV = GovSettings(congress_api_key="cg_test", courtlistener_token="cl_test")
 INTEL = PoliticsIntelSettings(odds_api_key="odds_test")
+SEC = SecSettings(user_agent="QuantTest research@example.com", using_default_user_agent=False, min_interval_seconds=0.0)
 
 Answer = tuple[int, Any] | httpx.Response
 Route = Answer | Callable[[httpx.Request], Answer]
@@ -53,6 +57,27 @@ class RecordingSender:
         return OrderResult(True, "0xorder", "live")
 
 
+class RecordingOrderManager:
+    """Fake ``OrderManager``: records open-order queries and cancellations offline."""
+
+    def __init__(self, orders: tuple[RestingOrder, ...] = ()) -> None:
+        self.orders = orders
+        self.list_calls: list[str | None] = []
+        self.cancel_calls: list[str] = []
+
+    async def list_open_orders(
+        self, settings: PolySettings, condition_id: str | None = None
+    ) -> tuple[RestingOrder, ...]:
+        self.list_calls.append(condition_id)
+        if condition_id is None:
+            return self.orders
+        return tuple(o for o in self.orders if o.condition_id == condition_id)
+
+    async def cancel_order(self, settings: PolySettings, order_id: str) -> CancelResult:
+        self.cancel_calls.append(order_id)
+        return CancelResult(order_id=order_id, dry_run=False, canceled=True, status="canceled", wallet="0xdep")
+
+
 def make_server(
     routes: dict[str, Route],
     seen: list[httpx.Request] | None = None,
@@ -61,8 +86,15 @@ def make_server(
     polynode: Callable[[], PolynodeSettings] = lambda: POLYNODE,
     gov: Callable[[], GovSettings] = lambda: GOV,
     intel: Callable[[], PoliticsIntelSettings] = lambda: INTEL,
+    *,
+    poly: Callable[[], PolySettings] = lambda: POLY,
+    sec: Callable[[], SecSettings] = lambda: SEC,
+    ledger: Callable[[], LedgerSettings] | None = None,
+    manager: RecordingOrderManager | None = None,
 ) -> FastMCP:
     """Server whose HTTP is answered by ``routes`` keyed on URL path (JSON tuple or a ready Response)."""
+    mem_ledger = LedgerSettings(db_path=":memory:")
+    ledger_loader = ledger or (lambda: mem_ledger)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if seen is not None:
@@ -76,13 +108,16 @@ def make_server(
 
     return create_server(
         fred,
-        lambda: POLY,
+        poly,
         lambda: CryptoSettings(),
         polynode,
         gov,
         intel,
         transport=httpx.MockTransport(handler),
         order_sender=sender,
+        sec_settings_loader=sec,
+        ledger_settings_loader=ledger_loader,
+        order_manager=manager,
     )
 
 
@@ -382,7 +417,10 @@ def test_price_crypto_expiry_uses_binance_and_nearest_deribit_option() -> None:
     assert lines[0] == "BTCUSDT spot 100.00 | strike 101.00 | r* +0.00995 | horizon 24h"
     assert [line.split(" | ")[0] for line in lines[2:6]] == ["empirical", "normal_7d", "normal_full", "implied"]
     assert lines[2] == "empirical | 0.0000 | 1.0000 | n/a | 7 | +0.6000"  # 24h windows net to 0 < r*
-    assert lines[-1] == "implied vol: Deribit BTC-NEXT-102-C mark_iv"
+    assert lines[-1] == (
+        "implied vol: Deribit BTC-NEXT-102-C mark_iv=50.0% "
+        "(expiry +1.0h vs target; skew +0.00 iv_pts/10%K, BL digital adj +0.0000)"
+    )
 
 
 def test_crypto_errors_binance_fails_the_tool_deribit_only_degrades() -> None:
@@ -889,3 +927,490 @@ def test_malformed_or_failed_payloads_become_tool_errors() -> None:
     for tool, routes, arguments, message in cases:
         with pytest.raises(ToolError, match=message):
             call(make_server(routes), tool, **arguments)
+
+
+# --- Slow-Horizon Discovery, Settlement Rules, Horizon Carry & Order Lifecycle ---
+
+
+def test_search_markets_paginates_past_top_200_and_checks_horizon_window() -> None:
+    seen: list[httpx.Request] = []
+    page0 = [market(str(i), f"Short-term noise {i}", 0.50, 0.52) for i in range(200)]
+    page1 = [market("205", "Will FTC block Acme merger in Q4?", 0.41, 0.44)]
+
+    def gamma_markets(req: httpx.Request) -> Answer:
+        return (200, page1 if req.url.params.get("offset") == "200" else page0)
+
+    text = call(
+        make_server({"/markets": gamma_markets}, seen),
+        "search_markets",
+        query="acme merger",
+        min_days_to_expiry=10,
+        max_days_to_expiry=180,
+        order="volumeNum",
+        limit=5,
+    )
+
+    assert len(seen) == 2
+    assert (seen[0].url.params["order"], seen[1].url.params["offset"]) == ("volumeNum", "200")
+    assert text.splitlines()[1].startswith("205 | Will FTC block Acme merger in Q4? |")
+    with pytest.raises(ToolError, match="min_days_to_expiry must be strictly less than max_days_to_expiry"):
+        call(make_server({}), "search_markets", min_days_to_expiry=60, max_days_to_expiry=30)
+
+
+def test_search_events_uses_public_search_for_queries_and_events_for_catalog() -> None:
+    seen: list[httpx.Request] = []
+    ev = {
+        "id": "901",
+        "slug": "acme-merger-2026",
+        "title": "Acme / WidgetCo Antitrust Outcome",
+        "endDate": "2027-06-30T00:00:00Z",
+        "negRisk": True,
+        "volume": 420_000,
+        "closed": False,
+        "markets": [
+            {"id": "55", "groupItemTitle": "Approved", "active": True, "closed": False, "bestBid": 0.61, "bestAsk": 0.64}
+        ],
+    }
+    routes: dict[str, Route] = {"/public-search": (200, {"events": [ev]}), "/events": (200, [ev])}
+
+    q_text = call(make_server(routes, seen), "search_events", query="antitrust", tag="business", min_volume_usd=10_000)
+    cat_text = call(make_server(routes, seen), "search_events", min_volume_usd=10_000, limit=5)
+
+    assert (seen[0].url.path, seen[0].url.params["q"], seen[0].url.params["events_tag"]) == (
+        "/public-search",
+        "antitrust",
+        "business",
+    )
+    assert (seen[1].url.path, seen[1].url.params["order"]) == ("/events", "volume")
+    assert q_text.splitlines()[1] == (
+        "901 | acme-merger-2026 | Acme / WidgetCo Antitrust Outcome | 2027-06-30 | True | $420,000 | 1 | "
+        "55:Approved (0.61/0.64)"
+    )
+    assert cat_text == q_text
+    with pytest.raises(ToolError, match="Polymarket returned malformed events payload"):
+        call(make_server({"/public-search": (200, {"events": "bad"})}), "search_events", query="x")
+
+
+def test_get_market_resolution_rules_fetches_parent_event_and_flags_ambiguities() -> None:
+    mkt = {
+        "id": "777",
+        "slug": "will-tariff-deal-hit-100-2026",
+        "question": "Will the tariff merger deal hit $100 by Dec 31?",
+        "description": (
+            "Resolves YES if announced and enacted before 11:59 PM ET on Dec 31 according to a consensus of credible "
+            "reporting; otherwise resolves 50-50 (p3) if ambiguous. Includes Other outcomes."
+        ),
+        "resolutionSource": "",
+        "endDate": "2026-12-31T23:59:59Z",
+        "negRisk": True,
+        "negRiskMarketID": "0xneg",
+        "conditionId": "0x" + "c" * 64,
+        "questionID": "0x" + "d" * 64,
+        "umaResolutionStatuses": '["proposed"]',
+        "orderPriceMinTickSize": "0.01",
+        "orderMinSize": "5",
+        "clobTokenIds": '["t_yes", "t_no"]',
+        "events": [{"slug": "tariff-deals-2026"}],
+    }
+    ev = {"slug": "tariff-deals-2026", "title": "2026 Tariff Deals", "description": "Parent event level rules."}
+    routes: dict[str, Route] = {
+        "/markets/slug/will-tariff-deal-hit-100-2026": (200, mkt),
+        "/events/slug/tariff-deals-2026": (200, ev),
+    }
+
+    text = call(make_server(routes), "get_market_resolution_rules", market_id_or_slug="will-tariff-deal-hit-100-2026")
+
+    assert "market 777 | slug will-tariff-deal-hit-100-2026 | end 2026-12-31T23:59:59Z | negRisk=True (negRiskMarketID=0xneg)" in text
+    assert "tick_size: 0.01 | min_order_size: 5 | uma_statuses: proposed | source: UNSPECIFIED" in text
+    assert "parent_event: tariff-deals-2026 — 2026 Tariff Deals" in text
+    for flag in (
+        "TIMEZONE_CUTOFF",
+        "ANNOUNCED_VS_EFFECTIVE",
+        "TOUCH_VS_CLOSE",
+        "UNNAMED_CONSENSUS_SOURCE",
+        "P3_50_50_FALLBACK",
+        "NEG_RISK_OTHER_TRAP",
+    ):
+        assert flag in text
+    with pytest.raises(ToolError, match="Polymarket error 404"):
+        call(make_server({"/markets/999": (404, {"error": "not found"})}), "get_market_resolution_rules", market_id_or_slug="999")
+
+
+def test_horizon_aware_kelly_carry_and_annualized_growth_are_exact() -> None:
+    fill = OrderBookMath.walk((Level(0.50, 200),), "BUY", 50.0)
+    report = OrderBookMath.edge(fill, fair_prob=0.60, fair_prob_sd=0.05, days_to_resolution=73.0)
+    # edge = +0.10, shrunk = 0.20 * (0.01 / 0.0125) = 0.16, 365 / 73 = 5.0
+    expected_log_g = 5.0 * (0.60 * math.log(1.0 + 0.16) + 0.40 * math.log(1.0 - 0.16))
+    assert report.edge_per_day_bps == pytest.approx(1000.0 / 73.0)
+    assert report.annualized_return == pytest.approx(1.0)
+    assert report.annualized_log_growth == pytest.approx(expected_log_g)
+    with pytest.raises(PolyError, match="days_to_resolution must be a positive finite number"):
+        OrderBookMath.edge(fill, fair_prob=0.60, fair_prob_sd=0.05, days_to_resolution=0.0)
+
+    routes: dict[str, Route] = {"/book": book(bids=[("0.48", "100")], asks=[("0.50", "200")])}
+    lines = call(
+        make_server(routes),
+        "simulate_clob_fill",
+        token_id="111",
+        side="BUY",
+        amount_usd=50.0,
+        fair_prob=0.60,
+        fair_prob_sd=0.05,
+        days_to_resolution=73.0,
+    ).splitlines()
+    assert lines[2] == f"horizon 73d | carry +13.70 bps/d | ann_ret +100.00% | ann_log_growth {expected_log_g:+.2%}"
+
+
+def test_list_open_orders_and_cancel_order_respect_dry_run_and_key_guard() -> None:
+    cid = "0x" + "a" * 64
+    resting = RestingOrder(
+        order_id="0xord1",
+        condition_id=cid,
+        token_id="111",
+        outcome="Yes",
+        side="BUY",
+        price=0.40,
+        original_size=100.0,
+        size_matched=25.0,
+        status="LIVE",
+        created_at="2026-11-10T00:00:00+00:00",
+    )
+    mgr = RecordingOrderManager((resting,))
+    routes: dict[str, Route] = {"/markets/123": (200, {"conditionId": cid})}
+    srv = make_server(routes, manager=mgr)
+
+    listed = call(srv, "list_open_orders", market_id="123")
+    assert mgr.list_calls == [cid]
+    assert f"0xord1 | BUY | Yes | 0.4000 | 100.00 | 25.00 | $30.00 | LIVE | 111 | {cid}" in listed
+
+    dry = call(srv, "cancel_order", order_id="0xord1")  # dry_run defaults to True
+    assert dry.startswith("DRY RUN cancel order 0xord1:")
+    assert mgr.cancel_calls == []
+
+    live = call(srv, "cancel_order", order_id="0xord1", dry_run=False)
+    assert live == "CANCELED: order 0xord1 | status canceled | deposit wallet 0xdep (sig type 3)"
+    assert mgr.cancel_calls == ["0xord1"]
+
+    # Default SdkOrderManager refuses live account calls without POLY_PRIVATE_KEY, while dry_run=True still works.
+    keyless_srv = make_server(routes)
+    assert call(keyless_srv, "cancel_order", order_id="0xord1").startswith("DRY RUN cancel order 0xord1:")
+    with pytest.raises(ToolError, match="POLY_PRIVATE_KEY is required"):
+        call(keyless_srv, "list_open_orders")
+    with pytest.raises(ToolError, match="POLY_PRIVATE_KEY is required"):
+        call(keyless_srv, "cancel_order", order_id="0xord1", dry_run=False)
+
+
+# --- Long-Dated Crypto (365d) & One-Touch Barrier Pricing -------------------
+
+
+def test_expiry_pricer_one_touch_reflection_and_pathwise_high_low_math() -> None:
+    # 60 daily bars oscillating +/-2% (zero drift), so every 30-day terminal return is 0,
+    # while intra-window highs spike +6% above close and lows dip -6% below close.
+    closes = closes_from([0.02, -0.02] * 30, start=100.0)
+    highs = [c * math.exp(0.06) for c in closes]
+    lows = [c * math.exp(-0.06) for c in closes]
+    up_strike = closes[-1] * math.exp(0.04)  # r* = +0.04: terminal 0% never hits, pathwise +6% always hits
+
+    exp_up = ExpiryPricer.price(
+        "BTCUSDT", closes, up_strike, horizon_hours=720, implied_vol=0.60, contract_type="expiry", bar_hours=24, highs=highs, lows=lows
+    )
+    touch_up = ExpiryPricer.price(
+        "BTCUSDT", closes, up_strike, horizon_hours=720, implied_vol=0.60, contract_type="touch", bar_hours=24, highs=highs, lows=lows
+    )
+    exp_by = {e.name: e for e in exp_up.estimates}
+    touch_by = {e.name: e for e in touch_up.estimates}
+
+    assert (exp_by["empirical"].p_yes, touch_by["empirical"].p_yes) == (0.0, 1.0)
+    for name in ("normal_30d", "normal_full", "implied"):
+        sigma = touch_by[name].sigma_h
+        assert sigma is not None
+        tail = 1.0 - statistics.NormalDist(0.0, sigma).cdf(0.04)
+        assert exp_by[name].p_yes == pytest.approx(tail)
+        assert touch_by[name].p_yes == pytest.approx(min(1.0, 2.0 * tail))
+
+    down_strike = closes[-1] * math.exp(-0.04)  # downside touch barrier: P(min S_t <= K)
+    touch_dn = ExpiryPricer.price(
+        "BTCUSDT", closes, down_strike, horizon_hours=720, contract_type="touch", bar_hours=24, highs=highs, lows=lows
+    )
+    assert {e.name: e for e in touch_dn.estimates}["empirical"].p_yes == 1.0
+
+
+def test_price_crypto_expiry_long_horizon_uses_1d_klines_and_reports_deribit_skew() -> None:
+    seen: list[httpx.Request] = []
+    now_ms = 1_800_000_000_000
+    day_ms = 86_400_000
+    closes = closes_from([0.015, -0.015] * 25, start=100.0)
+    klines = [
+        [now_ms - (len(closes) - 1 - i) * day_ms, f"{c:.4f}", f"{c * 1.03:.4f}", f"{c * 0.97:.4f}", f"{c:.4f}", "1", now_ms - (len(closes) - 1 - i) * day_ms, "0", 1, "0", "0", "0"]
+        for i, c in enumerate(closes)
+    ]
+    exp_ts = now_ms + 31 * day_ms  # +1.0d after 720h (30d) horizon
+    ivs = {"BTC-EXP-100-C": 50.0, "BTC-EXP-120-C": 55.0, "BTC-EXP-140-C": 60.0}
+    instruments = [
+        {"instrument_name": name, "strike": float(name.split("-")[2]), "expiration_timestamp": exp_ts, "option_type": "call"}
+        for name in ivs
+    ]
+    routes: dict[str, Route] = {
+        "/api/v3/klines": (200, klines),
+        "/api/v2/public/get_instruments": (200, {"result": instruments}),
+        "/api/v2/public/get_order_book": lambda r: (200, {"result": {"mark_iv": ivs[r.url.params["instrument_name"]]}}),
+    }
+
+    lines = call(
+        make_server(routes, seen),
+        "price_crypto_expiry",
+        symbol="BTCUSDT",
+        strike=120.0,
+        horizon_hours=720,
+        contract_type="touch",
+    ).splitlines()
+
+    assert dict(seen[0].url.params) == {"symbol": "BTCUSDT", "interval": "1d", "limit": "1000"}
+    assert lines[0].endswith("| horizon 720h | touch (1d)")
+    assert lines[1] == "model | P(YES: high >= strike) | P(NO) | sigma_h | n"
+    assert [ln.split(" | ")[0] for ln in lines[2:6]] == ["empirical", "normal_30d", "normal_full", "implied"]
+    # d_iv/dK = (0.60 - 0.50) / (140 - 100) = 0.0025 -> +3.00 iv_pts per 10% strike; positive call skew lowers digital YES.
+    assert lines[-1].startswith(
+        "implied vol: Deribit BTC-EXP-120-C mark_iv=55.0% (expiry +1.0d vs target; skew +3.00 iv_pts/10%K, BL digital adj -"
+    )
+
+
+# --- SEC EDGAR Corporate Catalysts, Merger Math & Deep CourtListener --------
+
+
+def test_search_sec_filings_formats_8k_items_archive_url_and_403_guidance() -> None:
+    seen: list[httpx.Request] = []
+    efts_body = {
+        "hits": {
+            "total": {"value": 1},
+            "hits": [
+                {
+                    "_id": "0000320193-26-000010:form8k.htm",
+                    "_source": {
+                        "file_date": "2026-10-15",
+                        "form": "8-K",
+                        "ciks": ["0000320193"],
+                        "display_names": ["Apple Inc. (AAPL)"],
+                        "adsh": "0000320193-26-000010",
+                        "items": ["1.01", "8.01"],
+                        "file_description": "Merger Definitive Agreement",
+                    },
+                }
+            ],
+        }
+    }
+
+    text = call(
+        make_server({"/LATEST/search-index": (200, efts_body)}, seen),
+        "search_sec_filings",
+        query="second request",
+        forms=["8-K", "S-4"],
+        start_date="2026-01-01",
+        limit=5,
+    )
+
+    assert seen[0].headers["user-agent"] == "QuantTest research@example.com"
+    assert (seen[0].url.params["forms"], seen[0].url.params["startdt"]) == ("8-K,S-4", "2026-01-01")
+    assert "1.01 (Entry into Material Definitive Agreement), 8.01 (Other Material Events)" in text
+    assert "https://www.sec.gov/Archives/edgar/data/320193/000032019326000010/form8k.htm" in text
+
+    with pytest.raises(ToolError, match="SEC EFTS error 403 .* set SEC_USER_AGENT"):
+        call(make_server({"/LATEST/search-index": (403, {})}), "search_sec_filings", query="wells notice")
+
+
+def test_get_company_submissions_resolves_ticker_to_cik_and_filters_forms() -> None:
+    tickers = {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}}
+    subs = {
+        "name": "Apple Inc.",
+        "tickers": ["AAPL"],
+        "filings": {
+            "recent": {
+                "form": ["8-K/A", "4", "S-4"],
+                "filingDate": ["2026-11-01", "2026-10-30", "2026-10-15"],
+                "accessionNumber": ["0000320193-26-000020", "0000320193-26-000019", "0000320193-26-000018"],
+                "primaryDocument": ["d8ka.htm", "form4.xml", "s4.htm"],
+                "primaryDocDescription": ["Amended 8-K", "Insider Form 4", "Merger Registration"],
+                "items": [["5.02"], [], []],
+            }
+        },
+    }
+    routes: dict[str, Route] = {
+        "/files/company_tickers.json": (200, tickers),
+        "/submissions/CIK0000320193.json": (200, subs),
+    }
+    default_ua_sec = lambda: SecSettings.from_env({})
+    srv = make_server(routes, sec=lambda: SecSettings(min_interval_seconds=0.0, user_agent=default_ua_sec().user_agent))
+
+    lines = call(srv, "get_company_submissions", ticker_or_cik="aapl", forms=["8-K", "S-4"], limit=5).splitlines()
+
+    assert lines[0] == "SEC Submissions Apple Inc. (CIK 0000320193, tickers: AAPL) — 2 filings"
+    assert "8-K/A | items: 5.02 (Officer/Director Departure or Appointment)" in lines[1]
+    assert lines[2].startswith("2026-10-15 | S-4 | items: - | Merger Registration |")
+    assert lines[-1].startswith("NOTE: SEC_USER_AGENT not set;")
+    with pytest.raises(ToolError, match="Ticker 'ZZZZZ' not found in SEC company_tickers.json"):
+        call(srv, "get_company_submissions", ticker_or_cik="ZZZZZ")
+
+
+def test_calculate_merger_spread_prob_math_regimes_and_validation() -> None:
+    srv = make_server({})
+    # (90 - 60) / (100 - 60) = 0.75; 365 / 182.5 = 2.0 -> IRR = (100/90)^2 - 1 = 23.4568%
+    lines = call(
+        srv,
+        "calculate_merger_spread_prob",
+        target_price=90.0,
+        deal_offer_value=100.0,
+        downside_break_price=60.0,
+        days_to_close=182.5,
+    ).splitlines()
+    assert lines == [
+        "target $90.00 | offer $100.00 | break $60.00 | implied_close_prob 0.7500 (raw +0.7500)",
+        "gross_spread +10.00 (+11.11%) | break_downside -33.33% | horizon 182.5d | ann_simple +22.22% | deal_IRR +23.46%",
+    ]
+
+    above = call(srv, "calculate_merger_spread_prob", target_price=105.0, deal_offer_value=100.0, downside_break_price=60.0)
+    assert "implied_close_prob 1.0000 (raw +1.1250)" in above and "TRADING_ABOVE_OFFER" in above
+
+    with pytest.raises(ToolError, match=r"deal_offer_value \(50\.0\) must exceed downside_break_price \(60\.0\)"):
+        call(srv, "calculate_merger_spread_prob", target_price=55.0, deal_offer_value=50.0, downside_break_price=60.0)
+
+
+def test_search_court_opinions_and_get_docket_entries_format_holdings_and_recap_urls() -> None:
+    seen: list[httpx.Request] = []
+    opinions = {
+        "count": 1,
+        "results": [
+            {
+                "dateFiled": "2026-09-12",
+                "court": "Court of International Trade",
+                "docketNumber": "25-00066",
+                "citation": ["612 F. Supp. 3d 10"],
+                "caseName": "V.O.S. Selections v. Trump",
+                "absolute_url": "/opinion/99/vos-selections/",
+                "opinions": [{"snippet": "Preliminary <mark>injunction</mark> GRANTED."}],
+            }
+        ],
+    }
+    entries = {
+        "count": 1,
+        "results": [
+            {
+                "entry_number": 48,
+                "date_filed": "2026-09-10",
+                "description": "ORDER granting motion to stay enforcement.",
+                "recap_documents": [
+                    {
+                        "document_number": 48,
+                        "short_description": "Order on Stay",
+                        "filepath_local": "gov.uscourts.cit.1/doc48.pdf",
+                        "is_available": True,
+                    }
+                ],
+            }
+        ],
+    }
+    routes: dict[str, Route] = {
+        "/api/rest/v4/search/": (200, opinions),
+        "/api/rest/v4/docket-entries/": (200, entries),
+    }
+    srv = make_server(routes, seen)
+
+    op_lines = call(srv, "search_court_opinions", query="injunction", court="cit", limit=2).splitlines()
+    assert (seen[0].url.params["type"], seen[0].url.params["court"]) == ("o", "cit")
+    assert op_lines[1].endswith("612 F. Supp. 3d 10 | V.O.S. Selections v. Trump | https://www.courtlistener.com/opinion/99/vos-selections/")
+    assert op_lines[2] == "  snippet: Preliminary injunction GRANTED."
+
+    de_lines = call(srv, "get_docket_entries", docket_id=4201, limit=5).splitlines()
+    assert (seen[1].url.params["docket"], seen[1].url.params["order_by"]) == ("4201", "-date_filed")
+    assert de_lines[1] == "#48 | 2026-09-10 | ORDER granting motion to stay enforcement."
+    assert de_lines[2] == "  doc 48: Order on Stay | https://storage.courtlistener.com/gov.uscourts.cit.1/doc48.pdf"
+
+
+# --- Epistemic SQLite Ledger & Brier Calibration ----------------------------
+
+
+def test_epistemic_ledger_lifecycle_brier_skill_and_uncertainty_scaling(tmp_path: Path) -> None:
+    db_file = tmp_path / "test_ledger.sqlite3"
+    srv = make_server({}, ledger=lambda: LedgerSettings(db_path=str(db_file)))
+
+    up = call(
+        srv,
+        "record_forecast",
+        market_id="m1",
+        market_slug="fed-cut-dec",
+        family="macro",
+        horizon_days=30,
+        market_prob=0.50,
+        fair_prob=0.80,
+        fair_prob_sd=0.05,
+        side="YES",
+        recommended_usd=40.0,
+        thesis_summary="Core PCE decelerating below Fed projection.",
+        key_sources=["FRED:PCEPILFE"],
+        invalidation_triggers=["Core CPI MoM > 0.4%"],
+    )
+    assert "LEDGER UPSERT m1 (fed-cut-dec)" in up
+    call(
+        srv,
+        "record_forecast",
+        market_id="m1",
+        market_slug="fed-cut-dec",
+        family="macro",
+        horizon_days=29,
+        market_prob=0.50,
+        fair_prob=0.80,
+        fair_prob_sd=0.05,
+        side="YES",
+        recommended_usd=40.0,
+        order_id="0xmaker1",
+        thesis_summary="Core PCE decelerating below Fed projection.",
+        invalidation_triggers=["Core CPI MoM > 0.4%"],
+    )
+    active = call(srv, "get_active_theses", family="macro")
+    assert "0xmaker1" in active and "Core CPI MoM > 0.4%" in active
+
+    call(srv, "record_forecast", market_id="m2", market_slug="cpi-cool", family="macro", horizon_days=20, market_prob=0.50, fair_prob=0.90)
+    call(srv, "record_forecast", market_id="m3", market_slug="gdp-neg", family="macro", horizon_days=45, market_prob=0.50, fair_prob=0.20)
+    call(srv, "record_forecast", market_id="c1", market_slug="acme-mna", family="corporate", horizon_days=60, market_prob=0.40, fair_prob=0.70)
+
+    call(srv, "resolve_and_score_calibration", market_id="m1", outcome=1)
+    call(srv, "resolve_and_score_calibration", market_id="m2", outcome=1)
+    cal = call(srv, "resolve_and_score_calibration", market_id="m3", outcome=0)
+
+    # Agent Brier = ((0.8-1)^2 + (0.9-1)^2 + (0.2-0)^2) / 3 = 0.0300; Market Brier = 0.2500; Skill = 1 - 0.03/0.25 = +0.8800
+    assert "Calibration (3 resolved) | agent_brier 0.0300 | market_brier 0.2500 | brier_skill_score +0.8800" in cal
+    assert "macro | 3 | 0.0300 | 0.2500 | +0.8800 | 0.50x" in cal
+    assert "0.8-0.9 | 1 | 0.8000 | 1.0000 | -0.2000" in cal
+
+    # Resolved theses leave active list; c1 remains open; settled markets cannot be overwritten.
+    remaining = call(srv, "get_active_theses")
+    assert "c1 | acme-mna" in remaining and "m1 |" not in remaining
+    with pytest.raises(ToolError, match="already resolved in the ledger"):
+        call(srv, "record_forecast", market_id="m1", market_slug="fed-cut-dec", family="macro", horizon_days=10, market_prob=0.5, fair_prob=0.6)
+    with pytest.raises(ToolError, match="not found in ledger"):
+        call(srv, "resolve_and_score_calibration", market_id="missing", outcome=1)
+
+    # Pure CalibrationMath check: badly overconfident family (fair=0.90, sd=0.05, outcome=0) inflates suggested_sd_multiplier > 1.25x.
+    overconfident = [
+        ForecastRecord(f"b{i}", "s", "politics", 10, 0.50, 0.90, 0.05, "YES", 10, None, "", (), (), "resolved", 0, "t", "t", "t")
+        for i in range(3)
+    ]
+    bad_report = CalibrationMath.score(overconfident)
+    assert bad_report.brier_skill_score == pytest.approx(1.0 - 0.81 / 0.25)
+    assert bad_report.families[0].suggested_sd_multiplier == 3.0
+
+
+def test_server_instructions_and_tool_routing_metadata() -> None:
+    srv = make_server({})
+    assert srv.instructions is not None
+    for expected in ("get_active_theses", "get_market_resolution_rules", "Falcon MCP", "Firecrawl MCP"):
+        assert expected in srv.instructions
+
+    async def inspect_tools() -> dict[str, str]:
+        async with Client(srv) as client:
+            return {t.name: (t.description or "") for t in await client.list_tools()}
+
+    descriptions = asyncio.run(inspect_tools())
+    assert len(descriptions) == 33
+    assert "Wallet 360" in descriptions["get_market_holders"]
+    assert "firecrawl_scrape" in descriptions["search_sec_filings"]
+    assert "Kalshi Markets" in descriptions["search_predictit"]

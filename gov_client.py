@@ -150,15 +150,41 @@ class GovClient:
         Raises:
             GovError: No ``COURTLISTENER_API_TOKEN``, or CourtListener failed.
         """
-        if not self._settings.courtlistener_token:
-            raise GovError("COURTLISTENER_API_TOKEN is not set; CourtListener v4 search requires a (free) token.")
-        body = await self._get(
-            "CourtListener",
-            f"{self._settings.courtlistener_url}/search/",
+        body = await self._courtlistener(
+            "search/",
             {"q": query.strip(), "type": "r", "order_by": "dateFiled desc"},
-            headers={"Authorization": f"Token {self._settings.courtlistener_token}"},
         )
         return {"count": body.get("count"), "results": list(body.get("results") or [])[:limit]}
+
+    async def courtlistener_opinions(
+        self, query: str, court: str | None = None, limit: int = 10
+    ) -> dict[str, Any]:
+        """Judicial opinions (``type="o"``) matching ``query`` (and optional ``court`` slug), newest first."""
+        params: dict[str, str | int] = {"q": query.strip(), "type": "o", "order_by": "dateFiled desc"}
+        if court and court.strip():
+            params["court"] = court.strip()
+        body = await self._courtlistener("search/", params)
+        return {"count": body.get("count"), "results": list(body.get("results") or [])[:limit]}
+
+    async def courtlistener_docket_entries(self, docket_id: int, limit: int = 15) -> dict[str, Any]:
+        """Recent filings, orders, stays, and injunctions on one CourtListener RECAP ``docket_id``."""
+        if docket_id <= 0:
+            raise GovError("docket_id must be a positive integer.")
+        body = await self._courtlistener(
+            "docket-entries/",
+            {"docket": docket_id, "order_by": "-date_filed"},
+        )
+        return {"docket_id": docket_id, "count": body.get("count"), "results": list(body.get("results") or [])[:limit]}
+
+    async def _courtlistener(self, path: str, params: Mapping[str, str | int]) -> dict[str, Any]:
+        if not self._settings.courtlistener_token:
+            raise GovError("COURTLISTENER_API_TOKEN is not set; CourtListener v4 requires a (free) token.")
+        return await self._get(
+            "CourtListener",
+            f"{self._settings.courtlistener_url}/{path}",
+            params,
+            headers={"Authorization": f"Token {self._settings.courtlistener_token}"},
+        )
 
     async def _congress(self, path: str) -> dict[str, Any]:
         if not self._settings.congress_api_key:

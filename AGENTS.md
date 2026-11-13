@@ -1,14 +1,14 @@
 # AGENTS.md — Polymarket Quant MCP Server
 
 ## 1. Architecture & Anti-Overengineering Rules
-- **Flat Repository Structure:** Keep all modules at the repository root (`mcp_server.py`, `fred_client.py`, `poly_client.py`, `crypto_client.py`, `kalshi_client.py`) and all tests in `tests/`. Do NOT create nested subpackages (`src/`, `core/`, `adapters/`, `services/`, `utils/`).
+- **Flat Repository Structure:** Keep all modules at the repository root (`mcp_server.py`, `fred_client.py`, `poly_client.py`, `crypto_client.py`, `polynode_client.py`, `gov_client.py`, `politics_intel_client.py`, `sec_client.py`, `ledger_client.py`) and all tests in `tests/`. Do NOT create nested subpackages (`src/`, `core/`, `adapters/`, `services/`, `utils/`).
 - **Strict Separation of Responsibilities:**
-  1. `*_client.py`: Pure async HTTP clients (`httpx2` / `httpx`), typed `Settings` loaded from env, domain math (e.g., `BTCFairValuePricer`, orderbook VWAP walkers), and domain exceptions (`FredError`, `PolyError`). Zero FastMCP imports allowed here.
-  2. `mcp_server.py`: Contains `Gateway` wrappers, `TextFormatter`, `create_server()`, and `@server.tool` functions.
+  1. `*_client.py`: Pure async HTTP/SQLite clients (`httpx2` / `httpx`, `sqlite3`), typed `Settings` loaded from env, domain math (e.g., `ExpiryPricer`, `OrderBookMath`, `ResolutionRuleAuditor`, `MergerMath`, `CalibrationMath`, `PollDropoutCalculator`), and domain exceptions (`FredError`, `PolyError`, `CryptoError`, `PolynodeError`, `GovError`, `PoliticsIntelError`, `SecError`, `LedgerError`). Zero FastMCP imports allowed here.
+  2. `mcp_server.py`: Contains `SERVER_INSTRUCTIONS`, `Gateway` wrappers, `TextFormatter`, `create_server()`, and `@server.tool` functions.
 - **Per-Call Settings & Transport Injection:**
   - `create_server(settings_loader=..., transport=...)` MUST accept injectable settings loaders and an optional `httpx.AsyncBaseTransport`.
   - Load settings inside the `Gateway.call()` method on each tool invocation so the MCP server can always boot and list its tools even if an API key is missing from `.env`.
-  - Wrap all domain client exceptions (`FredError`, `PolyError`, `CryptoError`) into `fastmcp.exceptions.ToolError` inside the gateway so FastMCP returns the exact error reason to the LLM.
+  - Wrap all domain client exceptions (`FredError`, `PolyError`, `CryptoError`, `PolynodeError`, `GovError`, `PoliticsIntelError`, `SecError`, `LedgerError`) into `fastmcp.exceptions.ToolError` inside the gateway so FastMCP returns the exact error reason to the LLM.
 - **Compact Text Output (`TextFormatter`):**
   - MCP tools MUST return compact, human/LLM-readable strings formatted by `TextFormatter`, never raw multi-kilobyte JSON dicts.
 - **Trading Safety:**
